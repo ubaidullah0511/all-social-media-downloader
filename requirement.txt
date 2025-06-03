@@ -1,0 +1,7 @@
+yt-dlp
+instaloader
+gallery-dl
+requests
+selenium
+webdriver-manager
+fake-useragent
