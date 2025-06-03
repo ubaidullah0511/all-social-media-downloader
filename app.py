@@ -1,3 +1,4 @@
+# --- Imports ---
 import os
 import sys
 import subprocess
@@ -18,60 +19,24 @@ from webdriver_manager.chrome import ChromeDriverManager
 from fake_useragent import UserAgent
 import time
 import random
-
-
-
-
-# --- YouTube Downloader Function ---
-def download_youtube(url, mode="video", base_folder="yt_downloads"):
-    os.makedirs(base_folder, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    session_id = hashlib.md5(timestamp.encode()).hexdigest()[:8]
-    folder_name = f"yt_{session_id}"
-    folder_path = os.path.join(base_folder, folder_name)
-    os.makedirs(folder_path, exist_ok=True)
-
-    output_template = os.path.join(folder_path, "%(title).50s.%(ext)s")
-
+# ========================== Facebook Media Downloader ==========================
+def download_facebook_video(url, output_filename="video.mp4"):
     ydl_opts = {
-        "outtmpl": output_template,
-        "quiet": False,
-        "no_warnings": True,
-        "noplaylist": True,
+        'outtmpl': output_filename if output_filename.endswith('.mp4') else output_filename + '.mp4',
+        'quiet': False,
+        'noplaylist': True,
+        'format': 'best'
     }
-
-    if mode == "audio":
-        ydl_opts.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-        })
-    else:
-        ydl_opts["format"] = "best"
-
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            downloaded_file = ydl.prepare_filename(info)
-            if mode == "audio":
-                downloaded_file = downloaded_file.rsplit('.', 1)[0] + ".mp3"
-            print(f"\n✅ Download complete: {downloaded_file}")
-
-            metadata_path = os.path.join(folder_path, "metadata.json")
-            with open(metadata_path, "w", encoding="utf-8") as f:
-                json.dump(info, f, indent=2, ensure_ascii=False)
-            print(f"💾 Metadata saved: {metadata_path}")
+            print(f"[+] Downloading Facebook video from: {url}")
+            ydl.download([url])
+            print(f"[✔] Video saved as: {ydl_opts['outtmpl']}")
     except Exception as e:
-        print(f"❌ Download failed: {e}")
-
+        print(f"[!] Failed to download: {e}")
 
 def download_facebook_image(post_url, download_folder='facebook_images'):
-    # Define path to local ChromeDriver
-    CHROMEDRIVER_PATH = r"D:\projects and stuffs\google project\chromedriver-win64\chromedriver.exe"
-
+    CHROMEDRIVER_PATH = r"D:\\projects and stuffs\\google project\\chromedriver-win64\\chromedriver.exe"
     os.makedirs(download_folder, exist_ok=True)
     ua = UserAgent()
 
@@ -86,7 +51,6 @@ def download_facebook_image(post_url, download_folder='facebook_images'):
     chrome_options.add_argument(f"window-size={random.randint(1000,1400)},{random.randint(700,900)}")
 
     try:
-        # Use your local chromedriver
         service = Service(CHROMEDRIVER_PATH)
         driver = webdriver.Chrome(service=service, options=chrome_options)
     except Exception as e:
@@ -129,6 +93,10 @@ def download_facebook_image(post_url, download_folder='facebook_images'):
             filename = f"fb_image_{int(time.time())}.jpg"
             save_path = os.path.join(download_folder, filename)
 
+            if os.path.exists(save_path):
+                print(f"[!] Image already exists: {save_path}")
+                return save_path
+
             with open(save_path, 'wb') as f:
                 f.write(response.content)
 
@@ -141,27 +109,23 @@ def download_facebook_image(post_url, download_folder='facebook_images'):
     finally:
         driver.quit()
 
+# ========================== Facebook Auto Handler ==========================
+def handle_facebook_url(url):
+    url_lower = url.lower()
+    if 'reel' in url_lower:
+        print("[*] Detected Facebook Reel (Video)")
+        download_facebook_video(url)
+    elif 'photo' in url_lower or 'fbid=' in url_lower:
+        print("[*] Detected Facebook Photo (Image)")
+        download_facebook_image(url)
+    elif 'videos' in url_lower or 'watch' in url_lower:
+        download_facebook_video(url)
+    else:
+        print("[!] Facebook URL format not recognized for video/image download.")
 
+# ========================== instagram ==========================
 
-# --- Facebook Downloader ---
-def download_facebook_video(url, output_filename="video.mp4"):
-    ydl_opts = {
-        'outtmpl': output_filename if output_filename.endswith('.mp4') else output_filename + '.mp4',
-        'quiet': False,
-        'noplaylist': True,
-        'format': 'best'
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            print(f"[+] Downloading Facebook video from: {url}")
-            ydl.download([url])
-            print(f"[✔] Video saved as: {ydl_opts['outtmpl']}")
-    except Exception as e:
-        print(f"[!] Failed to download: {e}")
-
-# --- Instagram Downloader ---
-def download_instagram():
+def download_instagram(url):
     SETTINGS = instaloader.Instaloader(
         download_video_thumbnails=False,
         download_geotags=False,
@@ -170,38 +134,56 @@ def download_instagram():
         post_metadata_txt_pattern="", 
     )
 
-    while True:
-        link = input("Enter Instagram post URL (or 'e' to exit): ")
-        if link.lower() == "e":
-            print("Exiting Instagram downloader.")
-            break
-        try:
-            shortcode = link.split("/")[-2]
-            post = instaloader.Post.from_shortcode(SETTINGS.context, shortcode)
-            user_choice = input("Image or Video? (I/V, 'e' to exit): ").lower()
-            if user_choice == "e":
-                print("Exiting Instagram downloader.")
-                break
-            if user_choice in ["v", "video"] and post.is_video:
-                os.makedirs("videos", exist_ok=True)
-                os.chdir("videos")
-                print("Downloading video...")
-                SETTINGS.download_post(post, target="your_videos")
-                os.chdir("..")
-                print("Download complete :)")
-            elif user_choice in ["i", "image"] and not post.is_video:
-                os.makedirs("images", exist_ok=True)
-                os.chdir("images")
-                print("Downloading image...")
-                SETTINGS.download_post(post, target="your_pictures")
-                os.chdir("..")
-                print("Download complete :)")
-            else:
-                print("Invalid content type or input. Try again.")
-        except Exception as e:
-            print(f"Error: {e}. Check the link and try again.")
+    try:
+        # Extract shortcode from URL (always second last segment)
+        shortcode = url.split("/")[-2]
 
-# --- Twitter Media Downloader (gallery-dl) ---
+        # Detect post type from URL path
+        if "/reel/" in url:
+            content_type = "video"
+        elif "/p/" in url:
+            content_type = "image"
+        else:
+            print("[!] URL does not contain /p/ or /reel/. Cannot detect content type.")
+            return
+
+        post = instaloader.Post.from_shortcode(SETTINGS.context, shortcode)
+
+        # Check if post type matches expected content type
+        if content_type == "video" and post.is_video:
+            os.makedirs("videos", exist_ok=True)
+            print("Downloading video...")
+            SETTINGS.download_post(post, target="videos")
+            print("Download complete :)")
+        elif content_type == "image" and not post.is_video:
+            os.makedirs("images", exist_ok=True)
+            print("Downloading image...")
+            SETTINGS.download_post(post, target="images")
+            print("Download complete :)")
+        else:
+            print("[!] Content type in URL does not match actual media type of the post.")
+            print(f"URL content type: {content_type}, Post.is_video: {post.is_video}")
+
+    except Exception as e:
+        print(f"Error: {e}. Check the link and try again.")
+
+            
+# ========================== YouTube Downloader ==========================
+def download_youtube_video(url, output_folder='youtube_downloads'):
+    os.makedirs(output_folder, exist_ok=True)
+    ydl_opts = {
+        'outtmpl': os.path.join(output_folder, '%(title)s.%(ext)s'),
+        'format': 'best'
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            print(f"[+] Downloading YouTube video from: {url}")
+            ydl.download([url])
+            print("[✓] YouTube video downloaded.")
+    except Exception as e:
+        print(f"[!] Failed to download YouTube video: {e}")
+
+# ========================== Twitter Downloader ==========================
 def download_tweet_media(tweet_url, output_dir="downloads"):
     print(f"📥 Downloading images from: {tweet_url}")
     os.makedirs(output_dir, exist_ok=True)
@@ -229,66 +211,32 @@ def download_tweet_media(tweet_url, output_dir="downloads"):
         print("❌ Download failed.")
         print(e.stderr)
 
-# --- Twitter Video Downloader (yt-dlp) ---
-def download_twitter_video(tweet_url):
-    output_name = input("Enter output filename (with extension, e.g., video.mp4): ").strip()
 
-    ydl_opts = {
-        'outtmpl': output_name,
-        'quiet': False,
-        'no_warnings': True,
-        'format': 'best',
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            print(f"Downloading Twitter video from: {tweet_url}")
-            ydl.download([tweet_url])
-        print("Download completed.")
-    except Exception as e:
-        print(f"Error: {e}")
-        print("No video found or download failed.")
-
-# --- Main App ---
+# ========================== Main App ==========================
 def main():
-
     while True:
-        print("\n--- Media Downloader ---")
-        print("1. Download Facebook Video")
-        print("2. Download Instagram Post")
-        print("3. Download Twitter Image ")
-        print("4. Download Twitter Video ")
-        print("5. Download YouTube Video/Audio")
-        print("6. Download Facebook Image")   
-        print("0. Exit")
+        url = input("\nEnter media URL (or type 'exit' to quit): ").strip()
 
-        choice = input("Select an option: ").strip()
-        if choice == "0":
+        if url.lower() == 'exit':
             print("Exiting app. Goodbye!")
             break
-        elif choice == "1":
-            url = input("Enter Facebook video URL (public): ").strip()
-            output = input("Enter output filename (default: video.mp4): ").strip()
-            if not output:
-                output = "video.mp4"
-            download_facebook_video(url, output)
-        elif choice == "2":
-            download_instagram()
-        elif choice == "3":
-            url = input("Enter Tweet URL for media download: ").strip()
-            download_tweet_media(url)
-        elif choice == "4":
-            url = input("Enter Tweet URL for video download: ").strip()
-            download_twitter_video(url)
-        elif choice == "5":
-            url = input("Enter YouTube URL: ").strip()
-            mode = input("Download mode ('video' or 'audio', default video): ").strip().lower()
-            if mode not in ["video", "audio"]:
-                mode = "video"
-            download_youtube(url, mode)
 
-        elif choice == "6":
-            url = input("Enter Facebook post URL (image): ").strip()
-            download_facebook_image(url)
+        if not url.startswith("http"):
+            print("[!] Invalid URL.")
+            continue
+
+        url_lower = url.lower()
+
+        if "facebook.com" in url_lower:
+            handle_facebook_url(url)
+        elif "instagram.com" in url_lower:
+            download_instagram(url)
+        elif "youtube.com" in url_lower or "youtu.be" in url_lower:
+            download_youtube_video(url)
+        elif "twitter.com" in url_lower or "x.com" in url_lower:
+            download_tweet_media(url)
+        else:
+            print("[!] Unsupported URL or platform.")
 
 if __name__ == "__main__":
     main()
