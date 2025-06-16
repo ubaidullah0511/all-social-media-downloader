@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Media Downloader Pro</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css"/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap');
+        
+        :root {
+            --primary: #00c3ff;
+            --primary-dark: #0080ff;
+            --dark: #0f172a;
+            --darker: #0b1120;
+        }
+        
+        body {
+            font-family: 'Poppins', sans-serif;
+            background: linear-gradient(135deg, var(--darker) 0%, var(--dark) 100%);
+            color: #fff;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+        
+        .card-hover {
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        
+        .card-hover:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 25px rgba(0, 195, 255, 0.2);
+        }
+        
+        .platform-icon {
+            transition: all 0.3s ease;
+        }
+        
+        .platform-card:hover .platform-icon {
+            transform: scale(1.1);
+        }
+        
+        .glow {
+            box-shadow: 0 0 15px rgba(0, 195, 255, 0.5);
+        }
+        
+        .input-glow:focus {
+            box-shadow: 0 0 10px rgba(0, 195, 255, 0.3);
+            border-color: var(--primary);
+        }
+        
+        .download-btn {
+            background: linear-gradient(45deg, var(--primary) 0%, var(--primary-dark) 100%);
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .download-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0, 195, 255, 0.4);
+        }
+        
+        .download-btn::after {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -60%;
+            width: 200%;
+            height: 200%;
+            background: rgba(255, 255, 255, 0.1);
+            transform: rotate(30deg);
+            transition: all 0.3s;
+        }
+        
+        .download-btn:hover::after {
+            left: 100%;
+        }
+        
+        .tab-active {
+            position: relative;
+            color: var(--primary);
+        }
+        
+        .tab-active::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 40px;
+            height: 3px;
+            background: var(--primary);
+            border-radius: 3px;
+            animation: tabUnderline 0.3s ease-out;
+        }
+        
+        @keyframes tabUnderline {
+            from {
+                width: 0;
+            }
+            to {
+                width: 40px;
+            }
+        }
+        
+        .quality-selector {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        
+        .quality-btn {
+            padding: 6px 12px;
+            border-radius: 20px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 13px;
+        }
+        
+        .quality-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+        
+        .quality-btn.active {
+            background: var(--primary);
+            color: white;
+            border-color: var(--primary);
+        }
+        
+        .floating {
+            animation: floating 3s ease-in-out infinite;
+        }
+        
+        @keyframes floating {
+            0% { transform: translateY(0px); }
+            50% { transform: translateY(-10px); }
+            100% { transform: translateY(0px); }
+        }
+        
+        .pulse {
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% {
+                box-shadow: 0 0 0 0 rgba(0, 195, 255, 0.7);
+            }
+            70% {
+                box-shadow: 0 0 0 10px rgba(0, 195, 255, 0);
+            }
+            100% {
+                box-shadow: 0 0 0 0 rgba(0, 195, 255, 0);
+            }
+        }
+        
+        .wave {
+            position: relative;
+        }
+        
+        .wave::before {
+            content: "";
+            position: absolute;
+            left: 0;
+            bottom: 0;
+            right: 0;
+            background-repeat: repeat;
+            height: 10px;
+            background-size: 20px 20px;
+            background-image: radial-gradient(circle at 10px -5px, transparent 12px, var(--dark) 13px);
+        }
+        
+        .wave::after {
+            content: "";
+            position: absolute;
+            left: 0;
+            bottom: 0;
+            right: 0;
+            background-repeat: repeat;
+            height: 15px;
+            background-size: 40px 20px;
+            background-image: radial-gradient(circle at 10px 15px, var(--dark) 12px, transparent 13px);
+        }
+        
+        .fade-in {
+            animation: fadeIn 0.5s ease-in;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        
+        .rotate {
+            animation: rotate 2s linear infinite;
+        }
+        
+        @keyframes rotate {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+        
+        /* Custom scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: var(--primary);
+            border-radius: 4px;
+        }
+        
+        /* Responsive adjustments */
+        @media (max-width: 768px) {
+            .tab-btn {
+                padding: 12px 8px;
+                font-size: 14px;
+            }
+            
+            .tab-active::after {
+                width: 30px;
+            }
+        }
+    </style>
+</head>
+<body class="relative">
+    <!-- Main Container -->
+    <div class="container mx-auto px-4 py-8 relative z-10">
+        <!-- Header -->
+        <header class="text-center mb-12">
+            <div class="inline-block relative">
+                <h1 class="text-5xl md:text-6xl font-bold mb-4 animate__animated animate__fadeInDown">
+                        Media Downloader Pro
+                </h1>
+                <div class="absolute -top-2 -right-2 w-4 h-4 rounded-full bg-blue-500 pulse"></div>
+            </div>
+            <p class="text-xl text-gray-300 max-w-2xl mx-auto animate__animated animate__fadeIn animate__delay-1s">
+                Download videos, images, and audio from popular platforms in high quality
+            </p>
+        </header>
+        
+        <!-- Main Card -->
+        <div class="max-w-4xl mx-auto bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-2xl shadow-2xl overflow-hidden animate__animated animate__fadeInUp animate__delay-1s card-hover">
+            <!-- Tabs -->
+            <div class="flex border-b border-gray-700 overflow-x-auto no-scrollbar">
+                <button class="tab-btn flex-1 py-4 px-6 text-center font-medium text-gray-300 hover:text-white transition-all duration-300 tab-active" data-tab="youtube">
+                    <i class="fab fa-youtube mr-2"></i> YouTube
+                </button>
+                <button class="tab-btn flex-1 py-4 px-6 text-center font-medium text-gray-300 hover:text-white transition-all duration-300" data-tab="facebook">
+                    <i class="fab fa-facebook mr-2"></i> Facebook
+                </button>
+                <button class="tab-btn flex-1 py-4 px-6 text-center font-medium text-gray-300 hover:text-white transition-all duration-300" data-tab="instagram">
+                    <i class="fab fa-instagram mr-2"></i> Instagram
+                </button>
+                <button class="tab-btn flex-1 py-4 px-6 text-center font-medium text-gray-300 hover:text-white transition-all duration-300" data-tab="twitter">
+                    <i class="fab fa-twitter mr-2"></i> Twitter
+                </button>
+            </div>
+            
+            <!-- Tab Content -->
+            <div class="p-6 md:p-8">
+                <!-- YouTube Tab -->
+                <div id="youtube-tab" class="tab-content fade-in">
+                    <div class="mb-6">
+                        <label for="youtube-url" class="block text-sm font-medium text-gray-300 mb-2">YouTube URL</label>
+                        <div class="relative">
+                            <input type="text" id="youtube-url" placeholder="https://www.youtube.com/watch?v=..." class="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg focus:outline-none focus:border-cyan-400 input-glow text-white pr-12">
+                            <button class="absolute right-2 top-1/2 transform -translate-y-1/2 bg-gray-600 hover:bg-gray-500 rounded-full p-2 transition-colors" id="youtube-paste">
+                                <i class="fas fa-paste text-sm"></i>
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="mb-6">
+                        <label class="block text-sm font-medium text-gray-300 mb-2">Download Type</label>
+                        <div class="flex flex-wrap gap-4">
+                            <label class="inline-flex items-center">
+                                <input type="radio" name="youtube-type" value="video" checked class="form-radio h-5 w-5 text-cyan-400">
+                                <span class="ml-2 text-gray-300">Video</span>
+                            </label>
+                            <label class="inline-flex items-center">
+                                <input type="radio" name="youtube-type" value="audio" class="form-radio h-5 w-5 text-cyan-400">
+                                <span class="ml-2 text-gray-300">Audio (MP3)</span>
+                            </label>
+                        </div>
+                    </div>
+                    
+                    <div class="mb-6 hidden" id="youtube-quality-container">
+                        <label class="block text-sm font-medium text-gray-300 mb-2">Quality</label>
+                        <div class="quality-selector" id="youtube-quality-options">
+                            <!-- Quality options will be populated here -->
+                        </div>
+                    </div>
+                    
+                    <button id="youtube-download" class="download-btn w-full py-3 px-6 rounded-lg font-semibold text-white flex items-center justify-center">
+                        <span id="youtube-btn-text">Download Now</span>
+                        <span id="youtube-btn-loader" class="hidden ml-2">
+                            <svg class="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                            </svg>
+                        </span>
+                    </button>
+                </div>
+                
+                <!-- Facebook Tab -->
+                <div id="facebook-tab" class="tab-content hidden">
+                    <div class="mb-6">
+                        <label for="facebook-url" class="block text-sm font-medium text-gray-300 mb-2">Facebook URL</label>
+                        <div class="relative">
+                            <input type="text" id="facebook-url" placeholder="https://www.facebook.com/..." class="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg focus:outline-none focus:border-cyan-400 input-glow text-white pr-12">
+                            <button class="absolute right-2 top-1/2 transform -translate-y-1/2 bg-gray-600 hover:bg-gray-500 rounded-full p-2 transition-colors" id="facebook-paste">
+                                <i class="fas fa-paste text-sm"></i>
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="mb-6">
+                        <label class="block text-sm font-medium text-gray-300 mb-2">Content Type</label>
+                        <div class="flex flex-wrap gap-4">
+                            <label class="inline-flex items-center">
+                                <input type="radio" name="facebook-type" value="video" checked class="form-radio h-5 w-5 text-cyan-400">
+                                <span class="ml-2 text-gray-300">Video</span>
+                            </label>
+                            <label class="inline-flex items-center">
+                                <input type="radio" name="facebook-type" value="image" class="form-radio h-5 w-5 text-cyan-400">
+                                <span class="ml-2 text-gray-300">Image</span>
+                            </label>
+                        </div>
+                    </div>
+                    
+                    <button id="facebook-download" class="download-btn w-full py-3 px-6 rounded-lg font-semibold text-white flex items-center justify-center">
+                        <span id="facebook-btn-text">Download Now</span>
+                        <span id="facebook-btn-loader" class="hidden ml-2">
+                            <svg class="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                            </svg>
+                        </span>
+                    </button>
+                </div>
+                
+                <!-- Instagram Tab -->
+                <div id="instagram-tab" class="tab-content hidden">
+                    <div class="mb-6">
+                        <label for="instagram-url" class="block text-sm font-medium text-gray-300 mb-2">Instagram URL</label>
+                        <div class="relative">
+                            <input type="text" id="instagram-url" placeholder="https://www.instagram.com/p/..." class="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg focus:outline-none focus:border-cyan-400 input-glow text-white pr-12">
+                            <button class="absolute right-2 top-1/2 transform -translate-y-1/2 bg-gray-600 hover:bg-gray-500 rounded-full p-2 transition-colors" id="instagram-paste">
+                                <i class="fas fa-paste text-sm"></i>
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="mb-6">
+                        <label class="block text-sm font-medium text-gray-300 mb-2">Content Type</label>
+                        <div class="flex flex-wrap gap-4">
+                            <label class="inline-flex items-center">
+                                <input type="radio" name="instagram-type" value="image" checked class="form-radio h-5 w-5 text-cyan-400">
+                                <span class="ml-2 text-gray-300">Image</span>
+                            </label>
+                            <label class="inline-flex items-center">
+                                <input type="radio" name="instagram-type" value="video" class="form-radio h-5 w-5 text-cyan-400">
+                                <span class="ml-2 text-gray-300">Video</span>
+                            </label>
+                            <label class="inline-flex items-center">
+                                <input type="radio" name="instagram-type" value="story" class="form-radio h-5 w-5 text-cyan-400">
+                                <span class="ml-2 text-gray-300">Story</span>
+                            </label>
+                        </div>
+                    </div>
+                    
+                    <button id="instagram-download" class="download-btn w-full py-3 px-6 rounded-lg font-semibold text-white flex items-center justify-center">
+                        <span id="instagram-btn-text">Download Now</span>
+                        <span id="instagram-btn-loader" class="hidden ml-2">
+                            <svg class="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                            </svg>
+                        </span>
+                    </button>
+                </div>
+                
+                <!-- Twitter Tab -->
+                <div id="twitter-tab" class="tab-content hidden">
+                    <div class="mb-6">
+                        <label for="twitter-url" class="block text-sm font-medium text-gray-300 mb-2">Twitter URL</label>
+                        <div class="relative">
+                            <input type="text" id="twitter-url" placeholder="https://twitter.com/.../status/..." class="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg focus:outline-none focus:border-cyan-400 input-glow text-white pr-12">
+                            <button class="absolute right-2 top-1/2 transform -translate-y-1/2 bg-gray-600 hover:bg-gray-500 rounded-full p-2 transition-colors" id="twitter-paste">
+                                <i class="fas fa-paste text-sm"></i>
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="mb-6">
+                        <label class="block text-sm font-medium text-gray-300 mb-2">Content Type</label>
+                        <div class="flex flex-wrap gap-4">
+                            <label class="inline-flex items-center">
+                                <input type="radio" name="twitter-type" value="image" checked class="form-radio h-5 w-5 text-cyan-400">
+                                <span class="ml-2 text-gray-300">Image</span>
+                            </label>
+                            <label class="inline-flex items-center">
+                                <input type="radio" name="twitter-type" value="video" class="form-radio h-5 w-5 text-cyan-400">
+                                <span class="ml-2 text-gray-300">Video</span>
+                            </label>
+                            <label class="inline-flex items-center">
+                                <input type="radio" name="twitter-type" value="gif" class="form-radio h-5 w-5 text-cyan-400">
+                                <span class="ml-2 text-gray-300">GIF</span>
+                            </label>
+                        </div>
+                    </div>
+                    
+                    <button id="twitter-download" class="download-btn w-full py-3 px-6 rounded-lg font-semibold text-white flex items-center justify-center">
+                        <span id="twitter-btn-text">Download Now</span>
+                        <span id="twitter-btn-loader" class="hidden ml-2">
+                            <svg class="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                            </svg>
+                        </span>
+                    </button>
+                </div>
+                
+            </div>
+        </div>
+        
+        <!-- Features Section -->
+        <div class="max-w-4xl mx-auto mt-12 grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div class="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 card-hover">
+                <div class="text-cyan-400 mb-3">
+                    <i class="fas fa-bolt text-2xl"></i>
+                </div>
+                <h3 class="text-xl font-semibold mb-2">Lightning Fast</h3>
+                <p class="text-gray-300">Download videos in seconds with our high-speed servers</p>
+            </div>
+            <div class="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 card-hover">
+                <div class="text-cyan-400 mb-3">
+                    <i class="fas fa-shield-alt text-2xl"></i>
+                </div>
+                <h3 class="text-xl font-semibold mb-2">Safe & Secure</h3>
+                <p class="text-gray-300">No registration required and no data collection</p>
+            </div>
+            <div class="bg-gray-800 bg-opacity-50 backdrop-blur-lg rounded-xl p-6 card-hover">
+                <div class="text-cyan-400 mb-3">
+                    <i class="fas fa-mobile-alt text-2xl"></i>
+                </div>
+                <h3 class="text-xl font-semibold mb-2">Mobile Friendly</h3>
+                <p class="text-gray-300">Works perfectly on all devices including smartphones</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Tab switching
+        const tabs = document.querySelectorAll('.tab-btn');
+        const tabContents = document.querySelectorAll('.tab-content');
+        
+        tabs.forEach(tab => {
+            tab.addEventListener('click', () => {
+                // Remove active class from all tabs
+                tabs.forEach(t => t.classList.remove('tab-active'));
+                // Add active class to clicked tab
+                tab.classList.add('tab-active');
+                
+                // Hide all tab contents
+                tabContents.forEach(content => content.classList.add('hidden'));
+                // Show selected tab content
+                const tabId = tab.getAttribute('data-tab') + '-tab';
+                document.getElementById(tabId).classList.remove('hidden');
+            });
+        });
+
+        // Paste button handlers
+        document.querySelectorAll('[id$="-paste"]').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                try {
+                    const text = await navigator.clipboard.readText();
+                    const platform = btn.id.split('-')[0];
+                    document.getElementById(`${platform}-url`).value = text;
+                } catch (err) {
+                    console.error('Failed to read clipboard:', err);
+                }
+            });
+        });
+
+        // Download handlers
+        async function handleDownload(platform) {
+            const urlInput = document.getElementById(`${platform}-url`);
+            const typeInputs = document.getElementsByName(`${platform}-type`);
+            const btn = document.getElementById(`${platform}-download`);
+            const btnText = document.getElementById(`${platform}-btn-text`);
+            const btnLoader = document.getElementById(`${platform}-btn-loader`);
+            
+            const url = urlInput.value.trim();
+            let type = 'video';
+            
+            for (const input of typeInputs) {
+                if (input.checked) {
+                    type = input.value;
+                    break;
+                }
+            }
+            
+            if (!url) {
+                alert(`Please enter a ${platform.charAt(0).toUpperCase() + platform.slice(1)} URL`);
+                return;
+            }
+            
+            // Disable button and show loader
+            btn.disabled = true;
+            btnText.textContent = 'Downloading...';
+            btnLoader.classList.remove('hidden');
+            
+            try {
+                const response = await fetch('/download', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        url: url,
+                        platform: platform,
+                        content_type: type
+                    })
+                });
+                
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const contentDisposition = response.headers.get('content-disposition');
+                    let filename = `${platform}_${Date.now()}.${type === 'audio' ? 'mp3' : type === 'image' ? 'jpg' : 'mp4'}`;
+                    
+                    if (contentDisposition) {
+                        const filenameMatch = contentDisposition.match(/filename="?(.+)"?/);
+                        if (filenameMatch && filenameMatch[1]) {
+                            filename = filenameMatch[1];
+                        }
+                    }
+                    
+                    const downloadUrl = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = downloadUrl;
+                    a.download = filename;
+                    document.body.appendChild(a);
+                    a.click();
+                    window.URL.revokeObjectURL(downloadUrl);
+                    a.remove();
+                    
+                    alert('Download completed successfully!');
+                } else {
+                    const error = await response.json();
+                    alert(error.message || 'Download failed');
+                }
+            } catch (error) {
+                alert(error.message || 'An error occurred');
+            } finally {
+                // Re-enable button
+                btn.disabled = false;
+                btnText.textContent = 'Download Now';
+                btnLoader.classList.add('hidden');
+            }
+        }
+        
+        // Set up download button event listeners
+        document.getElementById('youtube-download').addEventListener('click', () => handleDownload('youtube'));
+        document.getElementById('facebook-download').addEventListener('click', () => handleDownload('facebook'));
+        document.getElementById('instagram-download').addEventListener('click', () => handleDownload('instagram'));
+        document.getElementById('twitter-download').addEventListener('click', () => handleDownload('twitter'));
+    </script>
+</body>
+</html>
