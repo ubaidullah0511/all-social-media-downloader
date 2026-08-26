@@ -299,8 +299,20 @@
                         <div class="quality-selector" id="youtube-quality-options">
                             <!-- Quality options will be populated here -->
                         </div>
+                        <p class="text-xs text-gray-400 mt-2" id="youtube-quality-hint"></p>
                     </div>
-                    
+
+                    <div class="mb-6 hidden" id="youtube-mode-container">
+                        <label class="block text-sm font-medium text-gray-300 mb-2">Output Mode</label>
+                        <div class="flex flex-wrap gap-4">
+            
+                            <label class="inline-flex items-center">
+                                <input type="radio" name="youtube-mode" value="compatibility" class="form-radio h-5 w-5 text-cyan-400">
+                                <span class="ml-2 text-gray-300">Max Compatibility (MP4/H.264/AAC)</span>
+                            </label>
+                        </div>
+                    </div>
+
                     <button id="youtube-download" class="download-btn w-full py-3 px-6 rounded-lg font-semibold text-white flex items-center justify-center">
                         <span id="youtube-btn-text">Download Now</span>
                         <span id="youtube-btn-loader" class="hidden ml-2">
@@ -489,83 +501,363 @@
             });
         });
 
+        // --- YouTube quality/mode selector ---
+        let youtubeSelectedQuality = null; // null = best available
+        let youtubeReadyToDownload = false;
+        function setYoutubeQualityButtons(qualities) {
+            const container = document.getElementById('youtube-quality-options');
+            const hint = document.getElementById('youtube-quality-hint');
+            container.innerHTML = '';
+            youtubeSelectedQuality = null;
+
+            const bestBtn = document.createElement('div');
+            bestBtn.className = 'quality-btn active';
+            bestBtn.textContent = 'Best available';
+            bestBtn.dataset.height = '';
+            container.appendChild(bestBtn);
+
+            qualities.forEach(q => {
+                const el = document.createElement('div');
+                el.className = 'quality-btn';
+                el.textContent = q.label;
+                el.dataset.height = q.height;
+                container.appendChild(el);
+            });
+
+            container.querySelectorAll('.quality-btn').forEach(el => {
+                el.addEventListener('click', () => {
+                    container.querySelectorAll('.quality-btn').forEach(b => b.classList.remove('active'));
+                    el.classList.add('active');
+                    youtubeSelectedQuality = el.dataset.height || null;
+                });
+            });
+
+            hint.textContent = qualities.length
+                ? `${qualities.length} resolution(s) actually available for this video.`
+                : 'Could not read available resolutions; only "Best available" can be used.';
+        }
+
+        async function refreshYoutubeQualities() {
+            const url = document.getElementById('youtube-url').value.trim();
+            const typeInputs = document.getElementsByName('youtube-type');
+            let type = 'video';
+            for (const input of typeInputs) if (input.checked) type = input.value;
+
+            const qualityContainer = document.getElementById('youtube-quality-container');
+            const modeContainer = document.getElementById('youtube-mode-container');
+
+            if (!url || type === 'audio') {
+                qualityContainer.classList.add('hidden');
+                modeContainer.classList.add('hidden');
+                return;
+            }
+
+            try {
+                const response = await fetch('/youtube/qualities', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+                const data = await response.json();
+                if (data.success) {
+                    setYoutubeQualityButtons(data.qualities);
+                    qualityContainer.classList.remove('hidden');
+                    modeContainer.classList.remove('hidden');
+
+                    youtubeReadyToDownload = true;
+
+                    const btnText = document.getElementById('youtube-btn-text');
+                    btnText.textContent = 'Download Now';
+
+                    return true;
+                }
+            } catch (err) {
+                console.error('Failed to fetch YouTube qualities:', err);
+            }
+            return false;
+        }
+
+        document.getElementById('youtube-url').addEventListener('input', () => {
+            youtubeReadyToDownload = false;
+            youtubeSelectedQuality = null;
+
+            document.getElementById('youtube-quality-container').classList.add('hidden');
+            document.getElementById('youtube-mode-container').classList.add('hidden');
+
+            document.getElementById('youtube-btn-text').textContent = 'Check Video';
+        });
+        Array.from(document.getElementsByName('youtube-type')).forEach(input =>
+            input.addEventListener('change', refreshYoutubeQualities));
+
+        // Live progress polling for YouTube downloads (GET /progress/<id>) — keeps the
+        // button from sitting on a generic "Downloading..." during a long 4K transcode.
+        const PROGRESS_STAGE_LABELS = {
+            starting: () => 'Starting...',
+            downloading_video: p => `Downloading video...${p.percent != null ? ' ' + p.percent + '%' : ''}`,
+            downloading_audio: p => `Downloading audio...${p.percent != null ? ' ' + p.percent + '%' : ''}`,
+            merging: () => 'Merging...',
+            validating: () => 'Validating...',
+            transcoding: p => `Converting to MP4...${p.percent != null ? ' ' + p.percent + '%' : ''}`,
+            preparing: () => 'Preparing download...',
+            ready: () => 'Ready',
+            failed: () => 'Failed',
+        };
+
+        function pollDownloadProgress(progressId, btnText) {
+            const intervalId = setInterval(async () => {
+                try {
+                    const res = await fetch(`/progress/${progressId}`);
+                    if (!res.ok) return;
+                    const p = await res.json();
+                    if (!p.success) return;
+                    const label = PROGRESS_STAGE_LABELS[p.stage];
+                    if (label) btnText.textContent = label(p);
+                } catch (err) {
+                    // transient poll failure — keep the last known label, try again next tick
+                }
+            }, 1000);
+            return () => clearInterval(intervalId);
+        }
+
         // Download handlers
         async function handleDownload(platform) {
-            const urlInput = document.getElementById(`${platform}-url`);
-            const typeInputs = document.getElementsByName(`${platform}-type`);
-            const btn = document.getElementById(`${platform}-download`);
-            const btnText = document.getElementById(`${platform}-btn-text`);
-            const btnLoader = document.getElementById(`${platform}-btn-loader`);
-            
-            const url = urlInput.value.trim();
-            let type = 'video';
-            
-            for (const input of typeInputs) {
+    const urlInput = document.getElementById(`${platform}-url`);
+    const typeInputs = document.getElementsByName(`${platform}-type`);
+    const btn = document.getElementById(`${platform}-download`);
+    const btnText = document.getElementById(`${platform}-btn-text`);
+    const btnLoader = document.getElementById(`${platform}-btn-loader`);
+
+    const url = urlInput.value.trim();
+    let type = 'video';
+
+    for (const input of typeInputs) {
+        if (input.checked) {
+            type = input.value;
+            break;
+        }
+    }
+
+    if (!url) {
+        alert(`Please enter a ${platform.charAt(0).toUpperCase() + platform.slice(1)} URL`);
+        return;
+    }
+
+    // =====================================================
+    // YOUTUBE VIDEO: FIRST CLICK = CHECK QUALITIES ONLY
+    // =====================================================
+    if (
+        platform === 'youtube' &&
+        type === 'video' &&
+        !youtubeReadyToDownload
+    ) {
+        btn.disabled = true;
+        btnText.textContent = 'Checking...';
+        btnLoader.classList.remove('hidden');
+
+        try {
+            const success = await refreshYoutubeQualities();
+
+            if (success) {
+                btnText.textContent = 'Download Now';
+
+                // IMPORTANT:
+                // STOP HERE.
+                // Do NOT call /download on the first click.
+                return;
+            } else {
+                alert('Could not get available video qualities.');
+            }
+        } catch (error) {
+            alert(error.message || 'Could not check video qualities.');
+        } finally {
+            btn.disabled = false;
+            btnLoader.classList.add('hidden');
+
+            if (!youtubeReadyToDownload) {
+                btnText.textContent = 'Check Video';
+            }
+        }
+
+        return;
+    }
+
+    // =====================================================
+    // SECOND CLICK = ACTUAL DOWNLOAD
+    // =====================================================
+
+    btn.disabled = true;
+    btnText.textContent = 'Downloading...';
+    btnLoader.classList.remove('hidden');
+
+    let stopPolling = null;
+
+    try {
+        const body = {
+            url: url,
+            platform: platform,
+            content_type: type
+        };
+
+        if (platform === 'youtube' && type === 'video') {
+
+            if (youtubeSelectedQuality) {
+                body.quality = youtubeSelectedQuality;
+            }
+
+            const modeInputs = document.getElementsByName('youtube-mode');
+
+            for (const input of modeInputs) {
                 if (input.checked) {
-                    type = input.value;
+                    body.quality_mode = input.value;
                     break;
                 }
             }
-            
-            if (!url) {
-                alert(`Please enter a ${platform.charAt(0).toUpperCase() + platform.slice(1)} URL`);
+
+            body.download_id = crypto.randomUUID().replace(/-/g, '');
+            stopPolling = pollDownloadProgress(body.download_id, btnText);
+
+            console.log('YouTube download request:', body);
+        }
+
+        const controller = new AbortController();
+
+        const timeoutId = setTimeout(
+            () => controller.abort(),
+            20 * 60 * 1000
+        );
+
+        let response;
+
+        try {
+            response = await fetch('/download', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(body),
+                signal: controller.signal,
+            });
+        } finally {
+            clearTimeout(timeoutId);
+            if (stopPolling) stopPolling();
+        }
+
+        if (platform === 'youtube') {
+            // /download no longer streams the file itself — it always returns
+            // JSON pointing at a separate GET /file/<id> URL. That's what lets
+            // IDM (or Chrome's own download manager) intercept a normal,
+            // range-capable download instead of this POST processing endpoint.
+            const data = await response.json();
+
+            if (!data.success) {
+                alert(data.message || 'Download failed');
                 return;
             }
-            
-            // Disable button and show loader
-            btn.disabled = true;
-            btnText.textContent = 'Downloading...';
-            btnLoader.classList.remove('hidden');
-            
-            try {
-                const response = await fetch('/download', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        url: url,
-                        platform: platform,
-                        content_type: type
-                    })
-                });
-                
-                if (response.ok) {
-                    const blob = await response.blob();
-                    const contentDisposition = response.headers.get('content-disposition');
-                    let filename = `${platform}_${Date.now()}.${type === 'audio' ? 'mp3' : type === 'image' ? 'jpg' : 'mp4'}`;
-                    
-                    if (contentDisposition) {
-                        const filenameMatch = contentDisposition.match(/filename="?(.+)"?/);
-                        if (filenameMatch && filenameMatch[1]) {
-                            filename = filenameMatch[1];
-                        }
-                    }
-                    
-                    const downloadUrl = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = downloadUrl;
-                    a.download = filename;
-                    document.body.appendChild(a);
-                    a.click();
-                    window.URL.revokeObjectURL(downloadUrl);
-                    a.remove();
-                    
-                    alert('Download completed successfully!');
-                } else {
-                    const error = await response.json();
-                    alert(error.message || 'Download failed');
-                }
-            } catch (error) {
-                alert(error.message || 'An error occurred');
-            } finally {
-                // Re-enable button
-                btn.disabled = false;
-                btnText.textContent = 'Download Now';
-                btnLoader.classList.add('hidden');
+
+            const a = document.createElement('a');
+            a.href = data.download_url;
+            a.download = data.filename || '';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+
+            if (data.fallback && data.quality_used) {
+                alert(`Requested quality wasn't available. Downloaded at ${data.quality_used}p instead.`);
+            } else {
+                alert('Download starting...');
             }
+
+        } else if (response.ok) {
+
+            const blob = await response.blob();
+
+            const contentDisposition =
+                response.headers.get('content-disposition');
+
+            let filename =
+                `${platform}_${Date.now()}.${
+                    type === 'audio'
+                        ? 'mp3'
+                        : type === 'image'
+                            ? 'jpg'
+                            : 'mp4'
+                }`;
+
+            if (contentDisposition) {
+
+                const filenameMatch =
+                    contentDisposition.match(/filename="([^"]+)"/);
+
+                if (filenameMatch && filenameMatch[1]) {
+                    filename = filenameMatch[1];
+                }
+            }
+
+            const downloadUrl =
+                window.URL.createObjectURL(blob);
+
+            const a =
+                document.createElement('a');
+
+            a.href = downloadUrl;
+            a.download = filename;
+
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+
+            window.URL.revokeObjectURL(downloadUrl);
+
+            const fallback =
+                response.headers.get('X-Quality-Fallback');
+
+            const qualityUsed =
+                response.headers.get('X-Quality-Used');
+
+            if (fallback === 'True' && qualityUsed) {
+
+                alert(
+                    `Requested quality wasn't available. Downloaded at ${qualityUsed}p instead.`
+                );
+
+            } else {
+
+                alert('Download completed successfully!');
+            }
+
+        } else {
+
+            const error = await response.json();
+
+            alert(
+                error.message ||
+                'Download failed'
+            );
         }
-        
+
+    } catch (error) {
+
+        if (error.name === 'AbortError') {
+
+            alert(
+                'Download timed out after 20 minutes. Please try again.'
+            );
+
+        } else {
+
+            alert(
+                error.message ||
+                'An error occurred'
+            );
+        }
+
+    } finally {
+
+        btn.disabled = false;
+        btnText.textContent = 'Download Now';
+        btnLoader.classList.add('hidden');
+    }
+}
         // Set up download button event listeners
         document.getElementById('youtube-download').addEventListener('click', () => handleDownload('youtube'));
         document.getElementById('facebook-download').addEventListener('click', () => handleDownload('facebook'));

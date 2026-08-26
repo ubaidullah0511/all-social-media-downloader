@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>YouTube Downloader</title>
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<div class="app">
+  <header class="app-header">
+    <h1>YouTube Downloader</h1>
+  </header>
+
+  <div id="not-youtube" class="notice hidden">
+    Open a YouTube video first.
+  </div>
+
+  <div id="backend-offline" class="notice notice-error hidden">
+    Downloader backend is not running. Start the local server and try again.
+    <button id="retry-backend-btn" class="btn btn-link">Retry</button>
+  </div>
+
+  <main id="main-content" class="hidden">
+    <div class="video-info">
+      <div id="video-title" class="video-title">—</div>
+      <div id="video-url" class="video-url">—</div>
+    </div>
+
+    <button id="check-btn" class="btn btn-primary">Check Video</button>
+
+    <section id="results" class="hidden">
+      <div class="field">
+        <label>Download</label>
+        <div class="segmented" id="type-selector">
+          <button type="button" data-value="video" class="seg active">Video</button>
+          <button type="button" data-value="audio" class="seg">Audio only (MP3)</button>
+        </div>
+      </div>
+
+      <div class="field" id="quality-field">
+        <label>Quality</label>
+        <div class="chip-row" id="quality-options"></div>
+      </div>
+
+      <div class="field" id="mode-field">
+        <label>Output Mode</label>
+        <div class="mode-options">
+          <label class="mode-card">
+            <input type="radio" name="mode" value="compatibility">
+            <div class="mode-card-text">
+              <div class="mode-title">Max Compatibility</div>
+              <div class="mode-desc">Outputs MP4 with H.264 video + AAC audio for maximum compatibility with Windows and video editors.</div>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <button id="download-btn" class="btn btn-primary" disabled>Download</button>
+    </section>
+
+    <div class="status-row">
+      <span id="spinner" class="spinner hidden"></span>
+      <span id="status-text">Ready</span>
+    </div>
+
+    <div id="error-box" class="notice notice-error hidden"></div>
+  </main>
+</div>
+<script src="popup.js"></script>
+</body>
+</html>

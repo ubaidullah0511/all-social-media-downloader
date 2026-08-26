@@ -1,0 +1,8 @@
+flask
+yt-dlp
+instaloader
+selenium
+fake-useragent
+requests
+beautifulsoup4
+gallery-dl

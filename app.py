@@ -1,8 +1,16 @@
 import os
+import sys
+import json
+import logging
+import shutil
+import socket
+import uuid
 import tempfile
+import traceback
 import yt_dlp
 import instaloader
 import requests
+import unicodedata
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
@@ -10,6 +18,7 @@ from selenium.webdriver.chrome.options import Options
 from fake_useragent import UserAgent
 import time
 import random
+import mimetypes
 from flask import Flask, render_template, request, jsonify, send_file
 from urllib.parse import urlparse
 import threading
@@ -19,40 +28,668 @@ import re
 
 app = Flask(__name__)
 
+# CORS for the companion Chrome extension. Extension pages (popup/background)
+# send an `Origin: chrome-extension://<32-char-id>` header on cross-origin
+# fetch(); POST + Content-Type: application/json is a "non-simple" request,
+# so the browser preflights it with OPTIONS before the real call. Scoped to
+# chrome-extension origins (any installed extension) plus the backend's own
+# origin for direct same-machine testing — not a blanket `*`.
+_CORS_ORIGIN_RE = re.compile(r'^chrome-extension://[a-p]{32}$')
+_CORS_ALLOWED_ORIGINS = {'http://127.0.0.1:5000', 'http://localhost:5000'}
+
+
+@app.after_request
+def _add_cors_headers(response):
+    origin = request.headers.get('Origin', '')
+    if origin and (_CORS_ORIGIN_RE.match(origin) or origin in _CORS_ALLOWED_ORIGINS):
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        response.headers['Vary'] = 'Origin'
+    return response
+
+
+# Force line-buffered stdout: when this process's output is captured by an IDE
+# run window, a pipe, or `python app.py > log.txt`, Python defaults to full
+# block buffering (only flushes when the buffer fills or the process exits),
+# which looks exactly like "no logs ever appear" while a request is in flight.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except (AttributeError, ValueError):
+    pass
+
+# A dedicated, non-propagating handler so our logs always print regardless of
+# whatever Flask/Werkzeug did to the root logger (logging.basicConfig() is a
+# no-op if the root logger already has handlers, which would otherwise make
+# every _stage_log call below silently disappear).
+logger = logging.getLogger('downloader')
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logger.addHandler(_handler)
+    logger.propagate = False
+
+
+def _stage_log(download_id, stage, message=''):
+    logger.info(f'[{download_id}] {stage}' + (f' - {message}' if message else ''))
+
+
 # Configure temporary directory
 TEMP_DIR = tempfile.mkdtemp()
 
-# --- YouTube Downloader ---
-def download_youtube(url, mode="video"):
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
+FFMPEG_BIN = shutil.which('ffmpeg') or 'ffmpeg'
+FFPROBE_BIN = shutil.which('ffprobe') or 'ffprobe'
+
+# --- Prepared-download registry -------------------------------------------
+# /download does all the (slow) yt-dlp/FFmpeg work and registers the result
+# here; /file/<download_id> serves the already-finished file as a normal GET
+# resource. This is what lets IDM (or Chrome, or curl) intercept a real,
+# range-capable download URL instead of the POST processing endpoint.
+DOWNLOAD_FILES = {}
+DOWNLOAD_FILES_LOCK = threading.Lock()
+DOWNLOAD_EXPIRY_SECONDS = 45 * 60  # 45 minutes
+_DOWNLOAD_ID_RE = re.compile(r'^[0-9a-f]{32}$')
+
+# --- Progress registry ------------------------------------------------------
+# Keyed by the same download_id used throughout download_youtube(). The
+# frontend polls GET /progress/<id> while the blocking POST /download is in
+# flight so a slow FFmpeg transcode doesn't look like a frozen app.
+PROGRESS = {}
+PROGRESS_LOCK = threading.Lock()
+
+
+def _set_progress(download_id, stage, percent=None, speed=None, message=''):
+    with PROGRESS_LOCK:
+        PROGRESS[download_id] = {
+            'stage': stage,
+            'percent': percent,
+            'speed': speed,
+            'message': message,
+            'updated_at': time.time(),
+        }
+
+
+def register_download_file(path, download_name, temp_dir):
+    """Registers a completed file for GET retrieval and returns its download_id.
+    The id is the only thing ever exposed in a URL — the real path never is."""
+    download_id = uuid.uuid4().hex
+    with DOWNLOAD_FILES_LOCK:
+        DOWNLOAD_FILES[download_id] = {
+            'path': path,
+            'download_name': download_name,
+            'temp_dir': temp_dir,
+            'created_at': time.time(),
+        }
+    logger.info(f'REGISTERED DOWNLOAD FILE - id={download_id} path={path}')
+    return download_id
+
+
+def _cleanup_expired_downloads():
+    now = time.time()
+    with DOWNLOAD_FILES_LOCK:
+        expired_ids = [did for did, entry in DOWNLOAD_FILES.items()
+                       if now - entry['created_at'] > DOWNLOAD_EXPIRY_SECONDS]
+        expired_entries = [DOWNLOAD_FILES.pop(did) for did in expired_ids]
+    for entry in expired_entries:
+        logger.info(f"EXPIRED DOWNLOAD CLEANUP - removing {entry['temp_dir']}")
+        shutil.rmtree(entry['temp_dir'], ignore_errors=True)
+    with PROGRESS_LOCK:
+        stale_ids = [did for did, entry in PROGRESS.items()
+                     if now - entry['updated_at'] > DOWNLOAD_EXPIRY_SECONDS]
+        for did in stale_ids:
+            PROGRESS.pop(did, None)
+
+
+def _download_cleanup_loop():
+    while True:
+        time.sleep(300)  # sweep every 5 minutes
+        try:
+            _cleanup_expired_downloads()
+        except Exception as e:
+            logger.error(f'DOWNLOAD CLEANUP ERROR - {e}')
+
+# Network stalls (slow/broken connections) must raise, never hang the request forever.
+YT_SOCKET_TIMEOUT = 30
+YT_RETRIES = 5
+
+# Player clients that return progressive/adaptive formats without requiring
+# YouTube login cookies (the 'web' client needs a PO token and raises
+# "Sign in to confirm you're not a bot" otherwise).
+YT_PLAYER_CLIENTS = ['android', 'ios', 'tv']
+
+_QUALITY_LABELS = {2160: '2160p / 4K', 1440: '1440p / 2K', 1080: '1080p', 720: '720p', 480: '480p', 360: '360p', 240: '240p', 144: '144p'}
+_ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+class DownloadError(Exception):
+    """Carries a machine-readable stage code alongside the message."""
+    def __init__(self, code, message):
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
+
+def sanitize_filename(name, max_len=150):
+    name = _ILLEGAL_FILENAME_CHARS.sub('_', name or '').strip(' .')
+    name = re.sub(r'\s+', ' ', name)
+    return name[:max_len] if name else 'download'
+
+
+def _yt_base_opts():
+    return {
+        'quiet': False,
+        'no_warnings': False,
         'noplaylist': True,
-        'outtmpl': os.path.join(TEMP_DIR, '%(title)s.%(ext)s'),
+
+        # Use exported YouTube cookies
+        'cookiefile': r'D:\all-social-media-downloader\cookies.txt',
+
+        # Same EJS solver that made the CLI command work
+        'remote_components': {'ejs:github'},
+
+        # Explicitly use Deno for YouTube JS challenges
+        'js_runtimes': {
+            'deno': {}
+        },
+
+        # Timeout / retry protection
+        'socket_timeout': YT_SOCKET_TIMEOUT,
+        'retries': YT_RETRIES,
+        'fragment_retries': YT_RETRIES,
     }
 
-    if mode == "audio":
-        ydl_opts.update({
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-        })
-    else:
-        ydl_opts['format'] = 'best'
+def get_youtube_qualities(url, download_id=None):
+    """Return (title, [{height, label}]) using only resolutions that really exist."""
+    tag = download_id or uuid.uuid4().hex[:8]
+    logger.info(f'[{tag}] STARTING YT-DLP - metadata-only extract_info for {url}')
+    opts = {**_yt_base_opts(), 'logger': _YtDlpLogBridge(tag)}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        logger.error(f'[{tag}] YT-DLP EXIT CODE - metadata fetch failed: {e}')
+        raise
+    logger.info(f'[{tag}] YT-DLP EXIT CODE - 0 (metadata fetched)')
+    heights = sorted({f['height'] for f in info.get('formats', [])
+                       if f.get('height') and f.get('vcodec') not in (None, 'none')}, reverse=True)
+    qualities = [{'height': h, 'label': _QUALITY_LABELS.get(h, f'{h}p')} for h in heights]
+    return info.get('title', 'video'), qualities
+
+
+def ffprobe_json(path):
+    try:
+        result = subprocess.run(
+            [FFPROBE_BIN, '-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, timeout=60
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise DownloadError('FFPROBE_VALIDATION_FAILED', f'ffprobe could not run: {e}')
+    if result.returncode != 0:
+        raise DownloadError('FFPROBE_VALIDATION_FAILED', f'ffprobe exited {result.returncode}: {result.stderr.strip()}')
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        raise DownloadError('FFPROBE_VALIDATION_FAILED', f'ffprobe returned invalid JSON: {e}')
+
+
+def validate_media_file(path, require_audio=True, require_video=True):
+    """Raises DownloadError with a stage code if the file is not a genuinely playable media file."""
+    if not os.path.exists(path):
+        raise DownloadError('OUTPUT_FILE_MISSING', f'Output file was not created: {path}')
+    if os.path.getsize(path) == 0:
+        raise DownloadError('OUTPUT_FILE_EMPTY', f'Output file is empty: {path}')
+
+    probe = ffprobe_json(path)
+    streams = probe.get('streams', [])
+    video_streams = [s for s in streams if s.get('codec_type') == 'video']
+    audio_streams = [s for s in streams if s.get('codec_type') == 'audio']
+
+    if require_video and not video_streams:
+        raise DownloadError('VIDEO_STREAM_MISSING', 'No video stream found in output file')
+    if require_audio and not audio_streams:
+        raise DownloadError('AUDIO_STREAM_MISSING', 'No audio stream found in output file')
+
+    duration = float(probe.get('format', {}).get('duration') or 0)
+    if duration <= 0 and streams:
+        durations = [float(s.get('duration') or 0) for s in streams]
+        duration = max(durations) if durations else 0
+    if duration <= 0:
+        raise DownloadError('FFPROBE_VALIDATION_FAILED', 'Output file has zero duration')
+
+    # Playability check: -v error means anything on stderr is a real decode/container problem.
+    try:
+        decode = subprocess.run(
+            [FFMPEG_BIN, '-nostdin', '-v', 'error', '-i', path, '-f', 'null', '-'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, timeout=180
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise DownloadError('FFPROBE_VALIDATION_FAILED', f'ffmpeg decode check could not run: {e}')
+    if decode.returncode != 0 or decode.stderr.strip():
+        raise DownloadError('FFPROBE_VALIDATION_FAILED', f'Decode check failed: {decode.stderr.strip()[:500]}')
+
+    v = video_streams[0] if video_streams else {}
+    a = audio_streams[0] if audio_streams else {}
+    return {
+        'container': probe.get('format', {}).get('format_name'),
+        'video_codec': v.get('codec_name'),
+        'width': v.get('width'),
+        'height': v.get('height'),
+        'pix_fmt': v.get('pix_fmt'),
+        'audio_codec': a.get('codec_name'),
+        'sample_rate': a.get('sample_rate'),
+        'duration': duration,
+    }
+
+
+FFMPEG_PRESET = os.environ.get('FFMPEG_PRESET', 'veryfast')
+FFMPEG_STALL_SECONDS = int(os.environ.get('FFMPEG_STALL_SECONDS', '180'))
+FFMPEG_MAX_SECONDS = int(os.environ.get('FFMPEG_MAX_SECONDS', str(6 * 3600)))
+_HW_ENCODERS = ('h264_nvenc', 'h264_qsv', 'h264_amf')
+_NVENC_PRESET_MAP = {'ultrafast': 'p1', 'superfast': 'p2', 'veryfast': 'p3', 'faster': 'p4', 'fast': 'p4', 'medium': 'p5', 'slow': 'p6', 'slower': 'p6', 'veryslow': 'p7'}
+_hw_encoder_cache = None
+
+
+def _detect_hw_encoders():
+    """Returns the list of H.264 hardware encoders this FFmpeg binary supports (cached)."""
+    global _hw_encoder_cache
+    if _hw_encoder_cache is not None:
+        return _hw_encoder_cache
+    try:
+        result = subprocess.run(
+            [FFMPEG_BIN, '-hide_banner', '-encoders'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, timeout=15
+        )
+        output = result.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        output = ''
+    _hw_encoder_cache = [enc for enc in _HW_ENCODERS if enc in output]
+    return _hw_encoder_cache
+
+
+def _video_encode_args(encoder, preset):
+    if encoder == 'h264_nvenc':
+        return ['-c:v', 'h264_nvenc', '-preset', _NVENC_PRESET_MAP.get(preset, 'p4'), '-rc', 'vbr', '-cq', '20', '-b:v', '0']
+    if encoder == 'h264_qsv':
+        return ['-c:v', 'h264_qsv', '-preset', preset if preset in ('veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow') else 'veryfast', '-global_quality', '20']
+    if encoder == 'h264_amf':
+        return ['-c:v', 'h264_amf', '-quality', 'speed', '-rc', 'cqp', '-qp_i', '20', '-qp_p', '20', '-qp_b', '20']
+    return ['-c:v', 'libx264', '-preset', preset, '-crf', '20']
+
+
+def _run_ffmpeg_with_progress(cmd, download_id, duration, stall_seconds=FFMPEG_STALL_SECONDS, max_seconds=FFMPEG_MAX_SECONDS):
+    """Runs ffmpeg via Popen, streaming `-progress pipe:1` lines into logs/PROGRESS as they
+    arrive instead of buffering everything until exit. Kills the process if `out_time` stops
+    advancing for `stall_seconds` (a genuinely slow encode is fine; a stuck one is not)."""
+    logger.info(f'[{download_id}] STARTING FFMPEG - {" ".join(cmd)}')
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, bufsize=1)
+
+    stderr_tail = []
+
+    def _read_stderr():
+        for line in proc.stderr:
+            stderr_tail.append(line.rstrip())
+            del stderr_tail[:-200]
+
+    threading.Thread(target=_read_stderr, daemon=True).start()
+
+    watchdog_state = {'last_progress_at': time.time(), 'last_out_seconds': 0.0, 'started_at': time.time()}
+
+    def _watchdog():
+        while proc.poll() is None:
+            time.sleep(5)
+            now = time.time()
+            if now - watchdog_state['last_progress_at'] > stall_seconds:
+                logger.error(f'[{download_id}] FFMPEG STALL DETECTED - no progress for {stall_seconds}s, killing')
+                proc.kill()
+                return
+            if now - watchdog_state['started_at'] > max_seconds:
+                logger.error(f'[{download_id}] FFMPEG MAX DURATION EXCEEDED - {max_seconds}s, killing')
+                proc.kill()
+                return
+
+    threading.Thread(target=_watchdog, daemon=True).start()
+
+    block = {}
+    for raw_line in proc.stdout:
+        line = raw_line.strip()
+        if not line or '=' not in line:
+            continue
+        key, _, val = line.partition('=')
+        block[key] = val
+        if key != 'progress':
+            continue
+
+        out_time = block.get('out_time', '')
+        out_seconds = _parse_hms_to_seconds(out_time)
+        if out_seconds > watchdog_state['last_out_seconds']:
+            watchdog_state['last_out_seconds'] = out_seconds
+            watchdog_state['last_progress_at'] = time.time()
+
+        percent = round(min(100.0, out_seconds / duration * 100), 1) if duration > 0 else None
+        speed = block.get('speed')
+        frame = block.get('frame')
+        fps = block.get('fps')
+
+        logger.info(f'[{download_id}] FFMPEG PROGRESS - frame={frame} fps={fps} time={out_time} speed={speed}'
+                    + (f' percent={percent}%' if percent is not None else ''))
+        _set_progress(download_id, 'transcoding', percent=percent, speed=speed, message='Converting to MP4...')
+
+        block = {}
+        if val == 'end':
+            break
+
+    proc.wait(timeout=30)
+    return proc.returncode, '\n'.join(stderr_tail)
+
+
+def _parse_hms_to_seconds(hms):
+    try:
+        h, m, s = hms.split(':')
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+def _transcode_for_compatibility(src_path, dst_path, download_id, preset=None):
+    """Force H.264/AAC/yuv420p/faststart MP4, remuxing instead of re-encoding when already
+    compatible. Tries an available hardware encoder first (much faster on 4K), falling back
+    to libx264 on failure so the app never crashes just because a GPU encoder is missing."""
+    preset = preset or FFMPEG_PRESET
+    probe = ffprobe_json(src_path)
+    streams = probe.get('streams', [])
+    v = next((s for s in streams if s.get('codec_type') == 'video'), {})
+    a = next((s for s in streams if s.get('codec_type') == 'audio'), {})
+    duration = float(probe.get('format', {}).get('duration') or 0)
+    already_compatible = (
+        v.get('codec_name') == 'h264' and a.get('codec_name') == 'aac' and v.get('pix_fmt') == 'yuv420p'
+    )
+
+    base_io_args = ['-nostdin', '-y', '-i', src_path, '-map', '0:v:0', '-map', '0:a:0']
+    progress_args = ['-progress', 'pipe:1', '-nostats']
+
+    if already_compatible:
+        logger.info(f'[{download_id}] ENCODER SELECTED - remux (already H.264/AAC/yuv420p)')
+        cmd = [FFMPEG_BIN, '-nostdin', '-y', '-i', src_path, '-c', 'copy', '-movflags', '+faststart'] + progress_args + [dst_path]
+        returncode, stderr_tail = _run_ffmpeg_with_progress(cmd, download_id, duration)
+        if returncode != 0:
+            raise DownloadError('FFMPEG_TRANSCODE_FAILED', f'ffmpeg exited {returncode}: {stderr_tail[-800:]}')
+        return
+
+    use_hw = os.environ.get('FFMPEG_USE_HW', '1') != '0'
+    candidates = ([e for e in _detect_hw_encoders() if use_hw]) + ['libx264']
+
+    last_error = None
+    for encoder in candidates:
+        logger.info(f'[{download_id}] ENCODER SELECTED - {encoder}')
+        cmd = (
+            [FFMPEG_BIN] + base_io_args
+            + _video_encode_args(encoder, preset)
+            + ['-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-movflags', '+faststart']
+            + progress_args + [dst_path]
+        )
+        try:
+            returncode, stderr_tail = _run_ffmpeg_with_progress(cmd, download_id, duration)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            logger.error(f'[{download_id}] FFMPEG EXIT CODE - {encoder} could not run: {e}')
+            returncode, stderr_tail = -1, str(e)
+
+        logger.info(f'[{download_id}] FFMPEG EXIT CODE - {returncode} (encoder={encoder})')
+        if returncode == 0:
+            return
+
+        last_error = f'{encoder} exited {returncode}: {stderr_tail[-800:]}'
+        if encoder != 'libx264':
+            logger.warning(f'[{download_id}] HARDWARE ENCODER FAILED - {encoder}, falling back to next candidate')
+
+    raise DownloadError('FFMPEG_TRANSCODE_FAILED', last_error or 'ffmpeg failed with no candidates available')
+
+
+def _make_stage_hooks(download_id, audio_only=False):
+    """progress/postprocessor hooks that log video-download / audio-download / ffmpeg-merge
+    transitions as they actually happen inside a single yt-dlp extract_info() call."""
+    seen_download_stages = set()
+
+    def progress_hook(d):
+        info = d.get('info_dict') or {}
+        # audio-only mode: every fragment IS the audio track, no per-format guessing needed.
+        # video mode: bestvideo+bestaudio downloads two formats back to back — tell them
+        # apart from the format actually being fetched right now.
+        is_audio_only = audio_only or (
+            info.get('vcodec') in (None, 'none') and info.get('acodec') not in (None, 'none')
+        )
+        stage = 'audio download' if is_audio_only else 'video download'
+        progress_stage = 'downloading_audio' if is_audio_only else 'downloading_video'
+        progress_message = 'Downloading audio...' if is_audio_only else 'Downloading video...'
+        status = d.get('status')
+
+        if status == 'downloading':
+            downloaded = d.get('downloaded_bytes') or 0
+            total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+            percent = round(downloaded / total * 100, 1) if total else None
+            speed_bps = d.get('speed')
+            speed = f'{speed_bps / 1024 / 1024:.2f}MB/s' if speed_bps else None
+            _set_progress(download_id, progress_stage, percent=percent, speed=speed, message=progress_message)
+        elif status == 'finished':
+            _set_progress(download_id, progress_stage, percent=100, message=progress_message)
+
+        key = (stage, status)
+        if status in ('downloading', 'finished') and key not in seen_download_stages:
+            seen_download_stages.add(key)
+            _stage_log(download_id, stage, status)
+        elif status == 'error':
+            _stage_log(download_id, stage, 'error')
+
+    def postprocessor_hook(d):
+        name = d.get('postprocessor')
+        status = d.get('status')
+        if name == 'Merger':
+            _set_progress(download_id, 'merging', message='Merging...')
+            stage = 'ffmpeg merge'
+        else:
+            stage = f'postprocess:{name}'
+        _stage_log(download_id, stage, status)
+
+    return progress_hook, postprocessor_hook
+
+
+class _YtDlpLogBridge:
+    """yt-dlp's expected logger interface (debug/warning/error methods). yt-dlp routes
+    its own internal messages here instead of stdout/stderr — this is the equivalent of
+    capturing a subprocess's stdout/stderr when yt-dlp is used as a library, not a CLI."""
+    def __init__(self, download_id):
+        self.download_id = download_id
+
+    def debug(self, msg):
+        logger.info(f'[{self.download_id}] YT-DLP STDOUT - {msg}')
+
+    def info(self, msg):
+        logger.info(f'[{self.download_id}] YT-DLP STDOUT - {msg}')
+
+    def warning(self, msg):
+        logger.warning(f'[{self.download_id}] YT-DLP STDERR - {msg}')
+
+    def error(self, msg):
+        logger.error(f'[{self.download_id}] YT-DLP STDERR - {msg}')
+
+
+# --- YouTube Downloader ---
+def download_youtube(url, mode="video", quality=None, compatibility=False, download_id=None):
+    """
+    quality: requested max height (e.g. 1080, 2160) or None for best available.
+    compatibility: True forces MP4 + H.264 + AAC output; False preserves source codecs.
+    download_id: caller-supplied id (so the frontend can poll GET /progress/<id> for this
+    run before this function returns) — generated here if the caller didn't supply one.
+    Returns (success, dict) — see call sites for the two possible dict shapes.
+    """
+    download_id = download_id or uuid.uuid4().hex
+    logger.info(
+        f'[{download_id}] DOWNLOAD SETTINGS - '
+        f'mode={mode}, quality={quality}, compatibility={compatibility}'
+    )
+    work_dir = os.path.join(TEMP_DIR, download_id)
+    os.makedirs(work_dir, exist_ok=True)
+    progress_hook, postprocessor_hook = _make_stage_hooks(download_id, audio_only=(mode == "audio"))
+
+    yt_logger = _YtDlpLogBridge(download_id)
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            downloaded_file = ydl.prepare_filename(info)
-            if mode == "audio":
-                downloaded_file = downloaded_file.rsplit('.', 1)[0] + ".mp3"
-            return True, downloaded_file
-    except Exception as e:
-        return False, str(e)
+        if mode == "audio":
+            logger.info(f'[{download_id}] FETCHING FORMATS - {url}')
+            ydl_opts = {
+                **_yt_base_opts(),
+                'format': 'bestaudio/best',
+                'outtmpl': os.path.join(work_dir, 'audio.%(ext)s'),
+                'progress_hooks': [progress_hook],
+                'postprocessor_hooks': [postprocessor_hook],
+                'logger': yt_logger,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+            }
+            logger.info(f'[{download_id}] FORMAT SELECTED - bestaudio/best')
+            logger.info(f'[{download_id}] STARTING YT-DLP - mode=audio')
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+            except yt_dlp.utils.DownloadError as e:
+                logger.error(f'[{download_id}] YT-DLP EXIT CODE - failed: {e}')
+                raise DownloadError('AUDIO_DOWNLOAD_FAILED', str(e))
+            logger.info(f'[{download_id}] YT-DLP EXIT CODE - 0 (success)')
 
+            final_path = os.path.join(work_dir, 'audio.mp3')
+            logger.info(f'[{download_id}] VALIDATING FILE - {final_path}')
+            validation = validate_media_file(final_path, require_audio=True, require_video=False) if os.path.exists(final_path) else None
+            if not validation:
+                raise DownloadError('OUTPUT_FILE_MISSING', f'Expected mp3 not found: {final_path}')
+
+            title = info.get('title', 'audio')
+            download_name = make_safe_filename(f'{title}.mp3')
+
+            return True, {
+                'path': final_path,
+                'temp_dir': work_dir,
+                'download_name': download_name,
+                'validation': validation,
+            }
+
+        # --- video mode ---
+        logger.info(f'[{download_id}] FETCHING FORMATS - {url}')
+        title, qualities = get_youtube_qualities(url, download_id=download_id)
+        if not qualities:
+            raise DownloadError('VIDEO_STREAM_MISSING', 'No video formats available for this URL')
+
+        available_heights = [q['height'] for q in qualities]
+        fallback = False
+        if quality:
+            usable = [h for h in available_heights if h <= quality]
+            if not usable:
+                raise DownloadError(
+                    'REQUESTED_QUALITY_UNAVAILABLE',
+                    f'Requested {quality}p is unavailable; highest available is {max(available_heights)}p'
+                )
+            chosen_height = max(usable)
+            fallback = chosen_height != quality
+        else:
+            chosen_height = max(available_heights)
+
+        format_selector = f'bestvideo[height<={chosen_height}]+bestaudio/best[height<={chosen_height}]'
+        logger.info(f'[{download_id}] FORMAT SELECTED - {format_selector} (compatibility={compatibility})')
+
+        ydl_opts = {
+            **_yt_base_opts(),
+            'format': format_selector,
+            'outtmpl': os.path.join(work_dir, 'source.%(ext)s'),
+            'progress_hooks': [progress_hook],
+            'postprocessor_hooks': [postprocessor_hook],
+            'logger': yt_logger,
+        }
+        if compatibility:
+            # Let yt-dlp's own ffmpeg merger produce MP4 directly when the codecs allow it.
+            ydl_opts['merge_output_format'] = 'mp4'
+
+        logger.info(f'[{download_id}] STARTING YT-DLP - mode=video format={format_selector}')
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except yt_dlp.utils.PostProcessingError as e:
+            logger.error(f'[{download_id}] YT-DLP EXIT CODE - ffmpeg merge failed: {e}')
+            raise DownloadError('FFMPEG_MERGE_FAILED', str(e))
+        except yt_dlp.utils.DownloadError as e:
+            logger.error(f'[{download_id}] YT-DLP EXIT CODE - download failed: {e}')
+            raise DownloadError('VIDEO_DOWNLOAD_FAILED', str(e))
+        logger.info(f'[{download_id}] YT-DLP EXIT CODE - 0 (success)')
+
+        requested_downloads = info.get('requested_downloads') or []
+        if not requested_downloads or not requested_downloads[0].get('filepath'):
+            raise DownloadError('OUTPUT_FILE_MISSING', 'yt-dlp did not report an output file path')
+        source_path = requested_downloads[0]['filepath']
+
+        logger.info(f'[{download_id}] VALIDATING FILE - {source_path}')
+        _set_progress(download_id, 'validating', message='Validating...')
+        source_validation = validate_media_file(source_path, require_audio=True)
+
+        if compatibility:
+            logger.info(f'[{download_id}] ENTERING COMPATIBILITY TRANSCODE')
+            _set_progress(download_id, 'transcoding', percent=0, message='Converting to MP4...')
+            final_path = os.path.join(work_dir, 'final.mp4')
+            _transcode_for_compatibility(source_path, final_path, download_id)
+            logger.info(f'[{download_id}] VALIDATING FILE - {final_path}')
+            _set_progress(download_id, 'validating', message='Validating final file...')
+            validation = validate_media_file(final_path, require_audio=True)
+        else:
+            final_path = source_path
+            validation = source_validation
+
+        ext = os.path.splitext(final_path)[1]
+        download_name = make_safe_filename(f'{title}{ext}')
+
+        logger.info(f'[{download_id}] DOWNLOAD COMPLETE - {final_path}')
+        _set_progress(download_id, 'preparing', percent=100, message='Preparing download...')
+        return True, {
+            'path': final_path, 'temp_dir': work_dir, 'download_name': download_name,
+            'quality_requested': quality, 'quality_used': chosen_height, 'fallback': fallback,
+            'validation': validation,
+        }
+
+    except DownloadError as e:
+        logger.error(f'[{download_id}] FAILED - {e.code}: {e.message}\n{traceback.format_exc()}')
+        _set_progress(download_id, 'failed', message=e.message)
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return False, {'code': e.code, 'message': e.message}
+    except Exception as e:
+        logger.error(f'[{download_id}] FAILED - UNEXPECTED: {e}\n{traceback.format_exc()}')
+        _set_progress(download_id, 'failed', message=str(e))
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return False, {'code': 'VIDEO_DOWNLOAD_FAILED', 'message': str(e)}
+
+
+
+
+def make_safe_filename(filename):
+    # Replace common Unicode punctuation first
+    filename = filename.replace("…", "...")
+    filename = filename.replace("–", "-")
+    filename = filename.replace("—", "-")
+    filename = filename.replace("’", "'")
+    filename = filename.replace("“", '"')
+    filename = filename.replace("”", '"')
+
+    # Force ASCII for HTTP header compatibility
+    filename = unicodedata.normalize("NFKD", filename)
+    filename = filename.encode("ascii", "ignore").decode("ascii")
+
+    # Remove invalid Windows filename characters
+    filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+
+    filename = filename.strip().rstrip(".")
+
+    if not filename:
+        filename = "video.mp4"
+
+    return filename
 # --- Facebook Downloader ---
 def download_facebook(url, content_type="video"):
     if content_type == "image":
@@ -312,63 +949,215 @@ def _download_with_selenium(url, content_type):
         except:
             pass
 
+@app.route('/file/<download_id>', methods=['GET'])
+def serve_prepared_file(download_id):
+    """
+    Serves an already-completed file registered by /download. Never calls
+    yt-dlp/FFmpeg again — this route only reads a file that already exists
+    on disk. `download_id` is looked up in DOWNLOAD_FILES; nothing here ever
+    accepts or builds a filesystem path from request input, so there is no
+    directory-traversal surface.
+
+    Delegates Range/conditional handling entirely to Flask's send_file()
+    (conditional=True), which already implements correct 200/206/416 +
+    Content-Range/Accept-Ranges/Content-Length behavior — exactly what IDM,
+    Chrome, and curl expect from a normal downloadable resource.
+    """
+    if not _DOWNLOAD_ID_RE.match(download_id or ''):
+        return jsonify({'success': False, 'message': 'Invalid download id'}), 400
+
+    with DOWNLOAD_FILES_LOCK:
+        entry = DOWNLOAD_FILES.get(download_id)
+
+    if not entry:
+        return jsonify({'success': False, 'message': 'Download not found or expired'}), 404
+    if not os.path.exists(entry['path']):
+        return jsonify({'success': False, 'message': 'File is no longer available on disk'}), 410
+
+    safe_name = make_safe_filename(entry['download_name'])
+    mime = mimetypes.guess_type(safe_name)[0] or 'application/octet-stream'
+
+    logger.info(f'[{download_id}] SERVING FILE - {entry["path"]} as {safe_name!r} '
+                f'range={request.headers.get("Range")}')
+
+    return send_file(
+        entry['path'],
+        mimetype=mime,
+        as_attachment=True,
+        download_name=safe_name,
+        conditional=True,   # enables Range / If-Range / 206 / 416 support
+        max_age=0,
+    )
+
+
+@app.route('/progress/<download_id>', methods=['GET'])
+def get_progress(download_id):
+    """Polled by the frontend while POST /download is in flight so a slow 4K transcode
+    shows live stage/percent instead of a generic 'Downloading...' spinner."""
+    if not _DOWNLOAD_ID_RE.match(download_id or ''):
+        return jsonify({'success': False, 'message': 'Invalid id'}), 400
+    with PROGRESS_LOCK:
+        entry = PROGRESS.get(download_id)
+    if not entry:
+        return jsonify({'success': False, 'message': 'Unknown or expired id'}), 404
+    return jsonify({
+        'success': True,
+        'stage': entry['stage'],
+        'percent': entry['percent'],
+        'speed': entry['speed'],
+        'message': entry['message'],
+    })
+
+
 @app.route('/')
 def index():
     return render_template('index.html')
 
+@app.route('/youtube/qualities', methods=['POST'])
+def youtube_qualities():
+    data = request.get_json() or {}
+    url = data.get('url')
+    if not url:
+        return jsonify({'success': False, 'message': 'URL is required'})
+    try:
+        title, qualities = get_youtube_qualities(url)
+        return jsonify({'success': True, 'title': title, 'qualities': qualities})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
 @app.route('/download', methods=['POST'])
 def download():
-    data = request.get_json()
+    logger.info(f'DOWNLOAD REQUEST RECEIVED - method={request.method} path={request.path} '
+                f'content_type={request.content_type} remote_addr={request.remote_addr}')
+
+    data = request.get_json(silent=True) or {}
     url = data.get('url')
     platform = data.get('platform')
     content_type = data.get('content_type', 'video')
-    
+    logger.info(f'URL RECEIVED - platform={platform} content_type={content_type} url={url}')
+
     if not url:
+        logger.info('DOWNLOAD REQUEST REJECTED - no url in request body')
         return jsonify({'success': False, 'message': 'URL is required'})
 
     try:
         if platform == 'youtube':
             mode = 'audio' if content_type == 'audio' else 'video'
-            success, result = download_youtube(url, mode)
+            quality = data.get('quality')
+            quality = int(quality) if quality else None
+            quality_mode = str(data.get('quality_mode', '')).strip().lower()
+
+            logger.info(f"RAW QUALITY MODE = {quality_mode!r}")
+
+            compatibility = quality_mode in (
+                'compatibility',
+                'max compatibility',
+                'maximum compatibility',
+                'max_compatibility',
+                'maximum_compatibility',
+                'compatible'
+            )
+
+            logger.info(f"COMPATIBILITY FLAG = {compatibility}")
+
+            logger.info(
+                f"QUALITY MODE RAW={quality_mode!r} "
+                f"COMPATIBILITY={compatibility}"
+)
+            logger.info(
+                f'YOUTUBE DOWNLOAD OPTIONS - quality={quality} '
+                f'quality_mode={data.get("quality_mode")} '
+                f'compatibility={compatibility}'
+            )
+
+            requested_id = data.get('download_id')
+            progress_id = requested_id if requested_id and _DOWNLOAD_ID_RE.match(requested_id) else uuid.uuid4().hex
+            _set_progress(progress_id, 'starting', percent=0, message='Starting download...')
+
+            success, result = download_youtube(
+                url,
+                mode,
+                quality=quality,
+                compatibility=compatibility,
+                download_id=progress_id
+            )
+
+            if not success:
+                return jsonify({'success': False, 'message': result['message'], 'error_code': result['code']}), 422
+
+            safe_download_name = make_safe_filename(result['download_name'])
+            download_id = register_download_file(result['path'], safe_download_name, result['temp_dir'])
+            download_url = f"{request.host_url.rstrip('/')}/file/{download_id}"
+            _set_progress(progress_id, 'ready', percent=100, message='Ready')
+
+            return jsonify({
+                'success': True,
+                'download_id': download_id,
+                'download_url': download_url,
+                'filename': safe_download_name,
+                'quality_used': result.get('quality_used'),
+                'fallback': result.get('fallback', False),
+            })
+
         elif platform == 'facebook':
             success, result = download_facebook(url, content_type)
         elif platform == 'instagram':
             success, result = download_instagram(url, content_type)
         elif platform == 'twitter':
-            success, result = download_twitter(url, content_type)  # Updated call
+            success, result = download_twitter(url, content_type)
         else:
             return jsonify({'success': False, 'message': 'Unsupported platform'})
 
         if success:
-            if os.path.exists(result):
-                filename = os.path.basename(result)
+            if isinstance(result, str) and os.path.exists(result):
+                original_filename = os.path.basename(result)
+                safe_filename = make_safe_filename(original_filename)
+
+                logger.info(f"Sending file: {safe_filename!r}")
+
                 return send_file(
                     result,
                     as_attachment=True,
-                    download_name=filename
+                    download_name=safe_filename
                 )
-            return jsonify({'success': True, 'message': result})
+
+            return jsonify({
+                'success': True,
+                'message': result
+            })
+
         return jsonify({'success': False, 'message': result})
     except Exception as e:
+        logger.error(f'DOWNLOAD REQUEST FAILED - unhandled exception: {e}\n{traceback.format_exc()}')
         return jsonify({'success': False, 'message': str(e)})
 
-        if success:
-            if os.path.exists(result):
-                # Determine filename
-                filename = os.path.basename(result)
-                if platform == 'youtube' and content_type == 'audio':
-                    filename = filename.rsplit('.', 1)[0] + '.mp3'
-                
-                return send_file(
-                    result,
-                    as_attachment=True,
-                    download_name=filename
-                )
-            return jsonify({'success': True, 'message': result})
-        return jsonify({'success': False, 'message': result})
-    except Exception as e:
-        return jsonify({'success': False, 'message': str(e)})
+def _port_already_serving(host, port):
+    """
+    On Windows, Werkzeug's dev server sets SO_REUSEADDR, which (unlike on
+    Linux/Mac) lets a NEW process bind the same port while an OLD one is
+    still listening — both silently coexist and the OS picks one at random
+    per incoming connection. A forgotten `python app.py` from an earlier run
+    then keeps answering requests while you watch a different terminal that
+    never receives them and never logs anything. Refuse to start rather than
+    become a second silent listener.
+    """
+    check_host = '127.0.0.1' if host in ('0.0.0.0', '') else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        return s.connect_ex((check_host, port)) == 0
+
 
 if __name__ == "__main__":
     os.makedirs('templates', exist_ok=True)
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    _port = 5000
+    # debug=True's reloader re-execs this file in a child process that inherits
+    # the already-bound listening socket via WERKZEUG_RUN_MAIN/WERKZEUG_SERVER_FD
+    # — the port is legitimately "already serving" there by design, so only check
+    # on the original invocation (before the reloader has done anything).
+    if os.environ.get('WERKZEUG_RUN_MAIN') != 'true' and _port_already_serving('0.0.0.0', _port):
+        print(f'ERROR: port {_port} is already being served by another process '
+              f'(likely a `python app.py` left running from an earlier session).')
+        print(f'Find and stop it first: netstat -ano | findstr :{_port}   then   taskkill /F /PID <pid>')
+        sys.exit(1)
+    threading.Thread(target=_download_cleanup_loop, daemon=True).start()
+    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
