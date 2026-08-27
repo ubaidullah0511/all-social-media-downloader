@@ -1,13 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "YouTube Downloader (Local Backend)",
+  "name": "YouTube Downloader",
   "version": "1.0.0",
-  "description": "Check available qualities and download YouTube videos/audio through your local Flask + yt-dlp + FFmpeg backend.",
+  "description": "Check available qualities and download YouTube videos/audio. No local install or server required.",
 
   "permissions": ["activeTab", "tabs", "downloads", "storage"],
   "host_permissions": [
-    "http://127.0.0.1:5000/*",
-    "http://localhost:5000/*"
+    "https://all-social-media-downloader-production.up.railway.app/*"
   ],
 
   "background": {

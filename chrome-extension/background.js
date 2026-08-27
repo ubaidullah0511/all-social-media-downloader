@@ -3,7 +3,7 @@
 // (which video is downloading, at what quality/mode, filename, errors) lives
 // here in chrome.storage.session, keyed by the YouTube video URL.
 
-const BACKEND_URL = 'http://127.0.0.1:5000';
+const BACKEND_URL = 'https://all-social-media-downloader-production.up.railway.app';
 const DEV_MODE = true;
 const STORAGE_KEY = 'downloads';
 

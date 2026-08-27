@@ -20,6 +20,7 @@ import time
 import random
 import mimetypes
 from flask import Flask, render_template, request, jsonify, send_file
+from werkzeug.exceptions import HTTPException
 from urllib.parse import urlparse
 import threading
 import subprocess
@@ -158,6 +159,81 @@ YT_RETRIES = 5
 # "Sign in to confirm you're not a bot" otherwise).
 YT_PLAYER_CLIENTS = ['android', 'ios', 'tv']
 
+
+def _setup_youtube_cookiefile():
+    """Writes the YOUTUBE_COOKIES env var (Netscape cookie-file format) to a
+    private temp file yt-dlp can use as `cookiefile`. Never logs the content.
+    Returns None if the env var isn't set — cookie-less requests still work
+    for videos that don't need sign-in verification."""
+    raw = os.environ.get('YOUTUBE_COOKIES')
+    if not raw:
+        logger.info('YOUTUBE_COOKIES env var not set - continuing without cookies')
+        return None
+    try:
+        fd, path = tempfile.mkstemp(prefix='ytcookies_', suffix='.txt', dir=TEMP_DIR)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(raw)
+        os.chmod(path, 0o600)
+        logger.info('YouTube cookiefile created from YOUTUBE_COOKIES env var')
+        return path
+    except OSError as e:
+        logger.error(f'Failed to write YouTube cookiefile: {e}')
+        return None
+
+
+YOUTUBE_COOKIE_FILE = _setup_youtube_cookiefile()
+_DENO_AVAILABLE = shutil.which('deno') is not None
+if not _DENO_AVAILABLE:
+    logger.warning('deno binary not found - YouTube JS-challenge solving (EJS) is disabled')
+
+# Substrings of yt-dlp/requests error messages mapped to a machine-readable
+# code + a message safe to show the extension (never the raw exception, which
+# can otherwise leak file paths or other internals).
+_YT_ERROR_PATTERNS = [
+    (('sign in to confirm', 'not a bot'), 'YOUTUBE_BOT_CHECK',
+     "YouTube is asking for bot/sign-in verification. The server's YouTube cookies may be missing or expired."),
+    (('429', 'too many requests'), 'YOUTUBE_RATE_LIMITED',
+     'YouTube is rate-limiting requests from this server right now. Please wait a bit and try again.'),
+    (('cookies are no longer valid', 'has expired'), 'YOUTUBE_COOKIES_EXPIRED',
+     "The server's YouTube cookies have expired. An administrator needs to refresh them."),
+    (('private video', 'sign in to view'), 'YOUTUBE_AUTH_REQUIRED',
+     'This video is private or requires an account that has access to it.'),
+    (('video unavailable',), 'YOUTUBE_VIDEO_UNAVAILABLE',
+     'This video is unavailable (it may be deleted, private, or region-locked).'),
+    (('unsupported url', 'is not a valid url'), 'INVALID_URL',
+     'That does not look like a valid YouTube video URL.'),
+    (('unable to download webpage',), 'YOUTUBE_UNREACHABLE',
+     'Could not reach YouTube to fetch this video. Try again shortly.'),
+]
+
+
+def classify_youtube_error(exc):
+    """Maps a yt-dlp exception to (error_code, safe_message) for the API response."""
+    msg = str(exc).lower()
+    for keywords, code, friendly in _YT_ERROR_PATTERNS:
+        if any(k in msg for k in keywords):
+            return code, friendly
+    return 'YOUTUBE_EXTRACTION_FAILED', 'Could not process this YouTube video. It may be unavailable or YouTube may be blocking the request.'
+
+
+# --- Simple per-IP rate limiting for the expensive yt-dlp routes -----------
+# ponytail: in-memory sliding window, correct only for a single gunicorn
+# worker process (the current deployment). Swap for Redis if scaled to
+# multiple workers/dynos.
+_RATE_LIMIT_WINDOW_SECONDS = 60
+_RATE_LIMIT_MAX_REQUESTS = 12
+_rate_limit_hits = {}
+_rate_limit_lock = threading.Lock()
+
+
+def _is_rate_limited(key):
+    now = time.time()
+    with _rate_limit_lock:
+        hits = [t for t in _rate_limit_hits.get(key, []) if now - t < _RATE_LIMIT_WINDOW_SECONDS]
+        hits.append(now)
+        _rate_limit_hits[key] = hits
+        return len(hits) > _RATE_LIMIT_MAX_REQUESTS
+
 _QUALITY_LABELS = {2160: '2160p / 4K', 1440: '1440p / 2K', 1080: '1080p', 720: '720p', 480: '480p', 360: '360p', 240: '240p', 144: '144p'}
 _ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -177,27 +253,23 @@ def sanitize_filename(name, max_len=150):
 
 
 def _yt_base_opts():
-    return {
+    opts = {
         'quiet': False,
         'no_warnings': False,
         'noplaylist': True,
-
-        # Use exported YouTube cookies
-        'cookiefile': r'D:\all-social-media-downloader\cookies.txt',
-
-        # Same EJS solver that made the CLI command work
-        'remote_components': {'ejs:github'},
-
-        # Explicitly use Deno for YouTube JS challenges
-        'js_runtimes': {
-            'deno': {}
-        },
 
         # Timeout / retry protection
         'socket_timeout': YT_SOCKET_TIMEOUT,
         'retries': YT_RETRIES,
         'fragment_retries': YT_RETRIES,
     }
+    if YOUTUBE_COOKIE_FILE:
+        opts['cookiefile'] = YOUTUBE_COOKIE_FILE
+    if _DENO_AVAILABLE:
+        # EJS solver for YouTube's JS challenges (needs the deno binary on PATH)
+        opts['remote_components'] = {'ejs:github'}
+        opts['js_runtimes'] = {'deno': {}}
+    return opts
 
 def get_youtube_qualities(url, download_id=None):
     """Return (title, [{height, label}]) using only resolutions that really exist."""
@@ -556,7 +628,8 @@ def download_youtube(url, mode="video", quality=None, compatibility=False, downl
                     info = ydl.extract_info(url, download=True)
             except yt_dlp.utils.DownloadError as e:
                 logger.error(f'[{download_id}] YT-DLP EXIT CODE - failed: {e}')
-                raise DownloadError('AUDIO_DOWNLOAD_FAILED', str(e))
+                code, friendly = classify_youtube_error(e)
+                raise DownloadError(code, friendly)
             logger.info(f'[{download_id}] YT-DLP EXIT CODE - 0 (success)')
 
             final_path = os.path.join(work_dir, 'audio.mp3')
@@ -619,7 +692,8 @@ def download_youtube(url, mode="video", quality=None, compatibility=False, downl
             raise DownloadError('FFMPEG_MERGE_FAILED', str(e))
         except yt_dlp.utils.DownloadError as e:
             logger.error(f'[{download_id}] YT-DLP EXIT CODE - download failed: {e}')
-            raise DownloadError('VIDEO_DOWNLOAD_FAILED', str(e))
+            code, friendly = classify_youtube_error(e)
+            raise DownloadError(code, friendly)
         logger.info(f'[{download_id}] YT-DLP EXIT CODE - 0 (success)')
 
         requested_downloads = info.get('requested_downloads') or []
@@ -661,9 +735,10 @@ def download_youtube(url, mode="video", quality=None, compatibility=False, downl
         return False, {'code': e.code, 'message': e.message}
     except Exception as e:
         logger.error(f'[{download_id}] FAILED - UNEXPECTED: {e}\n{traceback.format_exc()}')
-        _set_progress(download_id, 'failed', message=str(e))
+        code, friendly = classify_youtube_error(e)
+        _set_progress(download_id, 'failed', message=friendly)
         shutil.rmtree(work_dir, ignore_errors=True)
-        return False, {'code': 'VIDEO_DOWNLOAD_FAILED', 'message': str(e)}
+        return False, {'code': code, 'message': friendly}
 
 
 
@@ -1009,12 +1084,23 @@ def get_progress(download_id):
     })
 
 
+@app.errorhandler(Exception)
+def handle_unexpected_error(e):
+    if isinstance(e, HTTPException):
+        return e
+    logger.error(f'UNHANDLED EXCEPTION - {e}\n{traceback.format_exc()}')
+    return jsonify({'success': False, 'message': 'An unexpected server error occurred.', 'error_code': 'INTERNAL_ERROR'}), 500
+
+
 @app.route('/')
 def index():
     return render_template('index.html')
 
 @app.route('/youtube/qualities', methods=['POST'])
 def youtube_qualities():
+    if _is_rate_limited(request.remote_addr):
+        return jsonify({'success': False, 'message': 'Too many requests, please slow down.', 'error_code': 'RATE_LIMITED'}), 429
+
     data = request.get_json() or {}
     url = data.get('url')
     if not url:
@@ -1023,12 +1109,17 @@ def youtube_qualities():
         title, qualities = get_youtube_qualities(url)
         return jsonify({'success': True, 'title': title, 'qualities': qualities})
     except Exception as e:
-        return jsonify({'success': False, 'message': str(e)})
+        code, friendly = classify_youtube_error(e)
+        logger.error(f'YOUTUBE QUALITIES FAILED - {code}: {e}')
+        return jsonify({'success': False, 'message': friendly, 'error_code': code}), 422
 
 @app.route('/download', methods=['POST'])
 def download():
     logger.info(f'DOWNLOAD REQUEST RECEIVED - method={request.method} path={request.path} '
                 f'content_type={request.content_type} remote_addr={request.remote_addr}')
+
+    if _is_rate_limited(request.remote_addr):
+        return jsonify({'success': False, 'message': 'Too many requests, please slow down.', 'error_code': 'RATE_LIMITED'}), 429
 
     data = request.get_json(silent=True) or {}
     url = data.get('url')

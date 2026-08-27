@@ -1,2 +1,4 @@
 myenv/
 cookies.txt
+__pycache__/
+*.log

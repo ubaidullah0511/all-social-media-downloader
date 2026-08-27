@@ -1,4 +1,4 @@
-const BACKEND_URL = 'http://127.0.0.1:5000';
+const BACKEND_URL = 'https://all-social-media-downloader-production.up.railway.app';
 const DEV_MODE = true;
 const YOUTUBE_RE = /^https?:\/\/(?:www\.)?youtube\.com\/watch\?[^#]*\bv=([\w-]+)|^https?:\/\/youtu\.be\/([\w-]+)/;
 
@@ -47,36 +47,9 @@ function clearError() {
   el.errorBox.textContent = '';
 }
 
-// ---- Friendly error mapping (only used for /youtube/qualities, where we
-// get the real backend JSON body — the /download path's errors come
-// pre-summarized from background.js since Chrome's downloads API doesn't
-// expose response bodies to the extension). ----
+// The backend already classifies YouTube errors (bot-check, rate limit,
+// expired cookies, etc.) into a plain-language `message` — just show it.
 function friendlyCheckError(rawMessage) {
-  const msg = (rawMessage || '').toLowerCase();
-  if (msg.includes('429') || msg.includes('too many requests')) {
-    return 'YouTube is rate-limiting requests right now (HTTP 429). Wait a bit and try again.';
-  }
-  if (msg.includes('sign in to confirm') || msg.includes('not a bot')) {
-    return "YouTube is asking for sign-in verification. The backend's cookies may be missing or expired.";
-  }
-  if (msg.includes('cookie')) {
-    return 'A YouTube cookie/authentication problem occurred on the backend. Check cookies.txt is valid.';
-  }
-  if (msg.includes('ejs') || msg.includes('deno') || msg.includes('challenge')) {
-    return "YouTube's JS challenge could not be solved by the backend (EJS/Deno). Check the Flask console.";
-  }
-  if (msg.includes('unsupported url') || msg.includes('is not a valid url')) {
-    return 'That does not look like a valid YouTube video URL.';
-  }
-  if (msg.includes('unable to download webpage') || msg.includes('video unavailable')) {
-    return 'Could not fetch this video (it may be private, deleted, or region-locked).';
-  }
-  if (msg.includes('no video formats') || msg.includes('no formats')) {
-    return 'No downloadable formats were found for this video.';
-  }
-  if (msg.includes('timed out') || msg.includes('timeout')) {
-    return 'The request to YouTube timed out. Check your connection and try again.';
-  }
   return rawMessage || 'Could not check this video.';
 }
 
