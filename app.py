@@ -160,21 +160,49 @@ YT_RETRIES = 5
 YT_PLAYER_CLIENTS = ['android', 'ios', 'tv']
 
 
+_MAX_COOKIE_CHUNKS = 20
+
+
+def _read_chunked_cookies():
+    """Reads YOUTUBE_COOKIES_1, YOUTUBE_COOKIES_2, ... in order and joins them
+    back into one Netscape cookie file. Used when the cookies don't fit in a
+    single YOUTUBE_COOKIES variable (Railway caps a variable at 32768 chars).
+    Stops at the first missing index, so a gap never silently drops the rest
+    of a longer sequence. Each chunk is expected to end on a complete cookie
+    line, so only its own leading/trailing newlines are trimmed (never
+    interior whitespace) before rejoining with '\\n'.
+    Returns (reconstructed_text_or_None, chunk_count)."""
+    chunks = []
+    for i in range(1, _MAX_COOKIE_CHUNKS + 1):
+        chunk = os.environ.get(f'YOUTUBE_COOKIES_{i}')
+        if not chunk:
+            break
+        chunks.append(chunk.strip('\n'))
+    return ('\n'.join(chunks) if chunks else None), len(chunks)
+
+
 def _setup_youtube_cookiefile():
-    """Writes the YOUTUBE_COOKIES env var (Netscape cookie-file format) to a
-    private temp file yt-dlp can use as `cookiefile`. Never logs the content.
-    Returns None if the env var isn't set — cookie-less requests still work
-    for videos that don't need sign-in verification."""
+    """Writes YOUTUBE_COOKIES — or, if that's unset, the reconstructed
+    YOUTUBE_COOKIES_1.._N chunks — to a private temp file yt-dlp can use as
+    `cookiefile`. Never logs the content. Returns None if no cookies are
+    configured — cookie-less requests still work for videos that don't need
+    sign-in verification."""
     raw = os.environ.get('YOUTUBE_COOKIES')
+    if raw:
+        source = 'YOUTUBE_COOKIES'
+    else:
+        raw, chunk_count = _read_chunked_cookies()
+        source = f'{chunk_count} chunked YOUTUBE_COOKIES_1..{chunk_count} vars' if raw else None
+
     if not raw:
-        logger.info('YOUTUBE_COOKIES env var not set - continuing without cookies')
+        logger.info('No YOUTUBE_COOKIES or YOUTUBE_COOKIES_1..N env vars set - continuing without cookies')
         return None
     try:
         fd, path = tempfile.mkstemp(prefix='ytcookies_', suffix='.txt', dir=TEMP_DIR)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(raw)
         os.chmod(path, 0o600)
-        logger.info('YouTube cookiefile created from YOUTUBE_COOKIES env var')
+        logger.info(f'YouTube cookiefile created from {source} ({len(raw)} chars)')
         return path
     except OSError as e:
         logger.error(f'Failed to write YouTube cookiefile: {e}')
