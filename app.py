@@ -1122,7 +1122,7 @@ def handle_unexpected_error(e):
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return 'Backend is running', 200
 
 @app.route('/youtube/qualities', methods=['POST'])
 def youtube_qualities():
